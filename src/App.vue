@@ -12,6 +12,7 @@ const appWindow = getCurrentWindow();
 const HOTKEY_TOGGLE = "CommandOrControl+Alt+H";
 const HOTKEY_CLICKTHROUGH = "CommandOrControl+Alt+C";
 const HOTKEY_FOCUS = "CommandOrControl+Alt+Space";
+const HOTKEY_QUIT = "CommandOrControl+Alt+Q";
 
 const opacity = ref(Number(localStorage.getItem("sbs.opacity") ?? 0.88));
 const model = ref(localStorage.getItem("sbs.model") ?? "qwen2.5:7b");
@@ -75,6 +76,10 @@ async function onAnswerClick(e: MouseEvent) {
   setTimeout(() => (btn.textContent = "Копировать"), 1200);
 }
 
+function quit() {
+  return appWindow.close();
+}
+
 async function toggleVisible() {
   if (await appWindow.isVisible()) await appWindow.hide();
   else await appWindow.show();
@@ -99,12 +104,14 @@ onMounted(async () => {
     (e) => e.state === "Pressed" && setClickThrough(!clickThrough.value),
   );
   await register(HOTKEY_FOCUS, (e) => e.state === "Pressed" && focusInput());
+  await register(HOTKEY_QUIT, (e) => e.state === "Pressed" && quit());
 });
 
 onBeforeUnmount(() => {
   unregister(HOTKEY_TOGGLE);
   unregister(HOTKEY_CLICKTHROUGH);
   unregister(HOTKEY_FOCUS);
+  unregister(HOTKEY_QUIT);
 });
 </script>
 
@@ -122,6 +129,11 @@ onBeforeUnmount(() => {
         </svg>
         <input v-model.number="opacity" type="range" min="0.25" max="1" step="0.05" />
       </label>
+      <button class="close" title="Закрыть (Ctrl+Alt+Q)" @click="quit">
+        <svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round">
+          <path d="M6 6l12 12M18 6L6 18" />
+        </svg>
+      </button>
     </header>
 
     <main class="body" @click="onAnswerClick">
@@ -143,6 +155,7 @@ onBeforeUnmount(() => {
           <span><kbd>Ctrl</kbd><kbd>Alt</kbd><kbd>Space</kbd> ввод</span>
           <span><kbd>Ctrl</kbd><kbd>Alt</kbd><kbd>H</kbd> скрыть</span>
           <span><kbd>Ctrl</kbd><kbd>Alt</kbd><kbd>C</kbd> сквозной режим</span>
+          <span><kbd>Ctrl</kbd><kbd>Alt</kbd><kbd>Q</kbd> закрыть</span>
         </div>
       </div>
     </main>
@@ -221,6 +234,7 @@ body {
   user-select: none;
 }
 .brand {
+  flex: 1;
   display: flex;
   align-items: center;
   gap: 8px;
@@ -245,6 +259,8 @@ body {
   color: #fbbf24;
 }
 .slider {
+  margin-left: auto;
+  margin-right: 10px;
   display: flex;
   align-items: center;
   gap: 6px;
@@ -254,6 +270,22 @@ body {
 .slider input {
   width: 84px;
   accent-color: var(--accent);
+}
+
+.close {
+  all: unset;
+  cursor: pointer;
+  display: grid;
+  place-items: center;
+  width: 26px;
+  height: 26px;
+  border-radius: 7px;
+  color: var(--muted);
+  transition: background 0.15s, color 0.15s;
+}
+.close:hover {
+  background: #ef4444;
+  color: #fff;
 }
 
 /* основная область */
