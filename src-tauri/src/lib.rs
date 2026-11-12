@@ -1,3 +1,4 @@
+mod ollama;
 #[cfg(windows)]
 mod vcursor_win;
 
@@ -55,6 +56,18 @@ async fn ask_ollama(model: String, system: String, question: String) -> Result<S
     Ok(parsed.message.content)
 }
 
+/// Список моделей, установленных в Ollama.
+#[tauri::command]
+async fn list_models() -> Result<Vec<String>, String> {
+    ollama::list_models().await
+}
+
+/// Загрузка модели в Ollama (по названию).
+#[tauri::command]
+async fn pull_model(name: String) -> Result<(), String> {
+    ollama::pull_model(&name).await
+}
+
 /// Включает/выключает режим «два курсора»: системная мышь замораживается,
 /// а движения и клики уходят в интерфейс (событие `vcursor`).
 #[tauri::command]
@@ -94,7 +107,7 @@ pub fn run() {
             let _ = app;
             Ok(())
         })
-        .invoke_handler(tauri::generate_handler![ask_ollama, set_virtual_cursor])
+        .invoke_handler(tauri::generate_handler![ask_ollama, list_models, pull_model, set_virtual_cursor])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
 }

@@ -5,7 +5,8 @@ import { LogicalPosition } from "@tauri-apps/api/dpi";
 import { invoke } from "@tauri-apps/api/core";
 import { listen, type UnlistenFn } from "@tauri-apps/api/event";
 import { register, unregister } from "@tauri-apps/plugin-global-shortcut";
-import "highlight.js/styles/github-dark.css";
+import hljsDark from "highlight.js/styles/github-dark.css?inline";
+import hljsLight from "highlight.js/styles/github.css?inline";
 import { askModel } from "./lib/ai";
 import { renderMarkdown } from "./lib/markdown";
 import { DEMO_ANSWER, DEMO_QUESTION } from "./lib/demo";
@@ -24,6 +25,83 @@ const opacity = ref(Number(localStorage.getItem("sbs.opacity") ?? 0.88));
 const model = ref(localStorage.getItem("sbs.model") ?? "qwen2.5:7b");
 const draft = ref("");
 const clickThrough = ref(false);
+
+// ---------- Тема ----------
+type Theme = "dark" | "light";
+const theme = ref<Theme>(localStorage.getItem("sbs.theme") === "light" ? "light" : "dark");
+watch(
+  theme,
+  (v) => {
+    localStorage.setItem("sbs.theme", v);
+    let tag = document.getElementById("hljs-theme") as HTMLStyleElement | null;
+    if (!tag) {
+      tag = document.createElement("style");
+      tag.id = "hljs-theme";
+      document.head.appendChild(tag);
+    }
+    tag.textContent = v === "light" ? hljsLight : hljsDark;
+  },
+  { immediate: true },
+);
+
+// ---------- Полный экран ----------
+const full = ref(false);
+async function toggleFull() {
+  full.value = !full.value;
+  await appWindow.setFullscreen(full.value);
+}
+
+// ---------- Прослушивание речи студента ----------
+// Программа не использует микрофон: речь преподавателя она не слышит.
+// Переключатель отвечает только за анализ голоса собеседника (звук из наушников).
+const listening = ref(localStorage.getItem("sbs.listen") !== "off");
+watch(listening, (v) => localStorage.setItem("sbs.listen", v ? "on" : "off"));
+
+// ---------- Модели Ollama ----------
+const models = ref<string[]>([]);
+const modelsError = ref("");
+const ddOpen = ref(false);
+const showPull = ref(false);
+const pullName = ref("");
+const pulling = ref(false);
+const pullMsg = ref("");
+const pullErr = ref("");
+const PRESETS = ["qwen2.5:3b", "qwen2.5:7b", "qwen2.5-coder:7b", "llama3.2:3b", "deepseek-r1:7b"];
+
+const modelOptions = computed(() => Array.from(new Set([model.value, ...models.value])));
+
+async function refreshModels() {
+  try {
+    models.value = await invoke<string[]>("list_models");
+    modelsError.value = "";
+  } catch (e) {
+    modelsError.value = String(e);
+  }
+}
+
+function pickModel(m: string) {
+  model.value = m;
+  ddOpen.value = false;
+}
+
+async function pullSelected() {
+  const name = pullName.value.trim();
+  if (!name || pulling.value) return;
+  pulling.value = true;
+  pullErr.value = "";
+  pullMsg.value = `Загружаю ${name}… Это может занять несколько минут.`;
+  try {
+    await invoke("pull_model", { name });
+    pullMsg.value = `Готово: ${name} загружена.`;
+    await refreshModels();
+    model.value = name;
+  } catch (e) {
+    pullMsg.value = "";
+    pullErr.value = String(e);
+  } finally {
+    pulling.value = false;
+  }
+}
 
 // Два режима: «ИИ» (свободный вопрос) и «Вопросы» (готовый список). У каждого свой экран ответа.
 type Mode = "ai" | "questions";
@@ -196,8 +274,15 @@ function onVirtualEvent(p: VEvent) {
     if (btn && vDownTarget?.closest("button") === btn) btn.click();
     vDownTarget = null;
   } else if (p.kind === "wheel") {
-    const body = document.querySelector<HTMLElement>(".body");
-    if (body) body.scrollTop -= (p.delta / 120) * 60;
+    // крутим ближайший прокручиваемый блок под красным курсором, иначе основную область
+    let el: HTMLElement | null = elementAtPointer();
+    while (el && el !== document.body) {
+      const oy = getComputedStyle(el).overflowY;
+      if ((oy === "auto" || oy === "scroll") && el.scrollHeight > el.clientHeight) break;
+      el = el.parentElement;
+    }
+    const target = el && el !== document.body ? el : document.querySelector<HTMLElement>(".body");
+    target?.scrollBy({ top: -(p.delta / 120) * 70 });
   }
 }
 
@@ -302,6 +387,7 @@ onMounted(async () => {
   await safeRegister(HOTKEY_FOCUS, focusInput);
   await safeRegister(HOTKEY_QUIT, quit);
   await safeRegister(HOTKEY_DUAL, () => setDual(!dual.value));
+  refreshModels();
   await safeRegister(HOTKEY_MODE, () => setMode(mode.value === "ai" ? "questions" : "ai"));
 });
 
@@ -320,7 +406,7 @@ onBeforeUnmount(() => {
 <template>
   <div
     class="panel"
-    :class="{ dual }"
+    :class="{ dual, light: theme === 'light' }"
     :style="{ '--op': opacity }"
     @pointermove="onPointerMove"
     @pointerleave="onPointerLeave"
@@ -328,13 +414,14 @@ onBeforeUnmount(() => {
     <header class="bar" @pointerdown="startDrag" @pointerup="endDrag" @pointercancel="endDrag">
       <div class="brand">
         <span class="grip" title="Потяните, чтобы переместить окно">
-          <svg viewBox="0 0 24 24" width="16" height="16">
+          <svg viewBox="1 0 20 24" width="14" height="17">
             <path d="M4 2v18l4.5-4.5L12 22l3-1.5-3.5-6.5H18z" fill="#ef4444" stroke="#fff" stroke-width="1.2" stroke-linejoin="round" />
           </svg>
         </span>
         <span class="title">SBS</span>
         <span v-if="clickThrough" class="badge">сквозной режим</span>
         <span v-if="dual" class="badge red">красный курсор</span>
+        <span v-if="!listening" class="badge">не слушаю</span>
       </div>
       <button
         class="dualbtn"
@@ -342,7 +429,7 @@ onBeforeUnmount(() => {
         title="Два курсора: мышь управляет красным курсором в окне (Ctrl+Alt+X)"
         @click="setDual(!dual)"
       >
-        <svg viewBox="0 0 24 24" width="13" height="13">
+        <svg viewBox="1 0 20 24" width="11" height="13">
           <path d="M4 2v18l4.5-4.5L12 22l3-1.5-3.5-6.5H18z" fill="currentColor" />
         </svg>
         2 курсора
@@ -353,7 +440,36 @@ onBeforeUnmount(() => {
         </svg>
         <input v-model.number="opacity" type="range" min="0.25" max="1" step="0.05" />
       </label>
-      <button class="close" title="Закрыть (Ctrl+Alt+Q)" @click="quit">
+      <button class="ibtn" :title="theme === 'dark' ? 'Светлая тема' : 'Тёмная тема'" @click="theme = theme === 'dark' ? 'light' : 'dark'">
+        <svg v-if="theme === 'dark'" viewBox="0 0 24 24" width="15" height="15" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round">
+          <circle cx="12" cy="12" r="4" />
+          <path d="M12 2v2M12 20v2M4.9 4.9l1.4 1.4M17.7 17.7l1.4 1.4M2 12h2M20 12h2M4.9 19.1l1.4-1.4M17.7 6.3l1.4-1.4" />
+        </svg>
+        <svg v-else viewBox="0 0 24 24" width="15" height="15" fill="none" stroke="currentColor" stroke-width="2" stroke-linejoin="round">
+          <path d="M21 12.8A9 9 0 1 1 11.2 3a7 7 0 0 0 9.8 9.8z" />
+        </svg>
+      </button>
+      <button
+        class="ibtn"
+        :class="{ off: !listening }"
+        :title="listening ? 'Слушаю речь студента. Нажмите, чтобы выключить анализ' : 'Анализ речи студента выключен. Нажмите, чтобы включить'"
+        @click="listening = !listening"
+      >
+        <svg viewBox="0 0 24 24" width="15" height="15" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+          <path d="M12 14a3 3 0 0 0 3-3V6a3 3 0 0 0-6 0v5a3 3 0 0 0 3 3z" />
+          <path d="M18 11a6 6 0 0 1-12 0M12 17v4" />
+          <path v-if="!listening" d="M4 4l16 16" stroke="#ef4444" stroke-width="2.4" />
+        </svg>
+      </button>
+      <button class="ibtn" :title="full ? 'Выйти из полного экрана' : 'Полный экран'" @click="toggleFull">
+        <svg v-if="!full" viewBox="0 0 24 24" width="15" height="15" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+          <path d="M4 9V4h5M20 9V4h-5M4 15v5h5M20 15v5h-5" />
+        </svg>
+        <svg v-else viewBox="0 0 24 24" width="15" height="15" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+          <path d="M9 4v5H4M15 4v5h5M9 20v-5H4M15 20v-5h5" />
+        </svg>
+      </button>
+      <button class="ibtn close" title="Закрыть (Ctrl+Alt+Q)" @click="quit">
         <svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round">
           <path d="M6 6l12 12M18 6L6 18" />
         </svg>
@@ -418,11 +534,49 @@ onBeforeUnmount(() => {
         @keydown="onKey"
       />
       <div class="row">
-        <input v-model="model" class="model" spellcheck="false" title="Модель Ollama" />
+        <div class="dd">
+          <button class="model-btn" title="Выбрать модель" @click="ddOpen = !ddOpen">
+            <span class="model-name">{{ model }}</span>
+            <span class="caret">▾</span>
+          </button>
+          <div v-if="ddOpen" class="dd-list">
+            <button v-for="m in modelOptions" :key="m" class="dd-item" :class="{ on: m === model }" @click="pickModel(m)">{{ m }}</button>
+            <div v-if="modelsError" class="dd-note">Ollama не отвечает. Список установленных моделей недоступен.</div>
+          </div>
+        </div>
+        <button class="ghost" title="Загрузить модель" @click="showPull = true; ddOpen = false">⤓ Модель</button>
         <button class="ghost" :disabled="ai.loading" @click="runDemo">▶ Тест</button>
         <button class="primary" :disabled="ai.loading || !draft.trim()" @click="ask">Спросить</button>
       </div>
     </footer>
+
+    <div v-if="showPull" class="modal">
+      <div class="card">
+        <div class="card-head">
+          <span>Загрузить модель</span>
+          <button class="ibtn" title="Закрыть" @click="showPull = false">
+            <svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round">
+              <path d="M6 6l12 12M18 6L6 18" />
+            </svg>
+          </button>
+        </div>
+        <div class="card-sub">
+          Укажите название модели из каталога Ollama или адрес вида <code>hf.co/пользователь/репозиторий</code>.
+          Ссылки на GitHub напрямую не поддерживаются: файл модели (GGUF) с GitHub сначала нужно скачать и импортировать в Ollama.
+        </div>
+        <div class="chips">
+          <button v-for="p in PRESETS" :key="p" class="chip" :class="{ on: pullName === p }" @click="pullName = p">{{ p }}</button>
+        </div>
+        <input v-model="pullName" class="search" placeholder="например, qwen2.5:7b" spellcheck="false" />
+        <div v-if="pulling" class="bar-progress"><i /></div>
+        <div v-if="pullMsg" class="card-msg">{{ pullMsg }}</div>
+        <div v-if="pullErr" class="error">{{ pullErr }}</div>
+        <div class="card-actions">
+          <button class="ghost" @click="showPull = false">Закрыть</button>
+          <button class="primary" :disabled="pulling || !pullName.trim()" @click="pullSelected">Загрузить</button>
+        </div>
+      </div>
+    </div>
 
     <svg
       v-show="ptr.show"
@@ -445,6 +599,34 @@ onBeforeUnmount(() => {
   --text: #e6e8f0;
   --muted: #8b90a3;
   --line: rgba(255, 255, 255, 0.08);
+  --s1: rgba(255, 255, 255, 0.05);
+  --s2: rgba(255, 255, 255, 0.08);
+  --s3: rgba(255, 255, 255, 0.14);
+  --field: rgba(0, 0, 0, 0.3);
+  --codebg: rgba(0, 0, 0, 0.35);
+  --strong: #fff;
+  --icode: #c4b5fd;
+  --accent-text: #c7caff;
+  --quote: #cfd2e0;
+  --placeholder: #5d6277;
+  --pop: #161925;
+}
+.panel.light {
+  --bg: 247, 248, 253;
+  --text: #1c2033;
+  --muted: #666b80;
+  --line: rgba(25, 30, 70, 0.14);
+  --s1: rgba(25, 30, 70, 0.045);
+  --s2: rgba(25, 30, 70, 0.08);
+  --s3: rgba(25, 30, 70, 0.14);
+  --field: rgba(255, 255, 255, 0.75);
+  --codebg: rgba(25, 30, 70, 0.05);
+  --strong: #000;
+  --icode: #6d28d9;
+  --accent-text: #4338ca;
+  --quote: #3a3f55;
+  --placeholder: #9096ab;
+  --pop: #ffffff;
 }
 html,
 body,
@@ -465,8 +647,8 @@ body {
 ::-webkit-scrollbar {
   width: 8px;
 }
-::-webkit-scrollbar-thumb {
-  background: rgba(255, 255, 255, 0.14);
+.panel ::-webkit-scrollbar-thumb {
+  background: var(--s3);
   border-radius: 8px;
 }
 ::-webkit-scrollbar-track {
@@ -474,6 +656,8 @@ body {
 }
 
 .panel {
+  position: relative;
+  color: var(--text);
   display: flex;
   flex-direction: column;
   height: 100%;
@@ -487,6 +671,7 @@ body {
 .bar {
   display: flex;
   align-items: center;
+  gap: 2px;
   justify-content: space-between;
   padding: 8px 12px;
   border-bottom: 1px solid var(--line);
@@ -494,10 +679,11 @@ body {
   touch-action: none;
 }
 .grip {
-  display: grid;
-  place-items: center;
-  width: 24px;
-  height: 24px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  width: 26px;
+  height: 26px;
   border-radius: 7px;
   background: rgba(239, 68, 68, 0.12);
 }
@@ -530,7 +716,11 @@ body {
   background: linear-gradient(135deg, var(--accent), var(--accent-2));
   box-shadow: 0 0 10px var(--accent);
 }
+.grip svg {
+  display: block;
+}
 .title {
+  line-height: 1;
   font-weight: 650;
   letter-spacing: 0.12em;
   font-size: 12px;
@@ -579,22 +769,31 @@ body {
   cursor: default;
 }
 .slider input {
-  width: 84px;
+  width: 64px;
   accent-color: var(--accent);
 }
 
-.close {
+.ibtn {
   all: unset;
+  box-sizing: border-box;
   cursor: pointer;
   display: grid;
   place-items: center;
+  flex: none;
   width: 26px;
   height: 26px;
   border-radius: 7px;
   color: var(--muted);
   transition: background 0.15s, color 0.15s;
 }
-.close:hover {
+.ibtn:hover {
+  background: var(--s3);
+  color: var(--text);
+}
+.ibtn.off {
+  color: #ef4444;
+}
+.ibtn.close:hover {
   background: #ef4444;
   color: #fff;
 }
@@ -694,7 +893,7 @@ kbd {
   padding: 1px 6px;
   margin-right: 3px;
   border-radius: 5px;
-  background: rgba(255, 255, 255, 0.07);
+  background: var(--s2);
   border: 1px solid var(--line);
   color: var(--text);
 }
@@ -722,15 +921,15 @@ kbd {
   margin-bottom: 3px;
 }
 .md strong {
-  color: #fff;
+  color: var(--strong);
 }
 .md :not(pre) > code {
   font-family: "Cascadia Code", Consolas, monospace;
   font-size: 12.5px;
   padding: 1px 6px;
   border-radius: 5px;
-  background: rgba(255, 255, 255, 0.08);
-  color: #c4b5fd;
+  background: var(--s2);
+  color: var(--icode);
 }
 .md blockquote {
   margin: 0 0 10px;
@@ -738,7 +937,7 @@ kbd {
   border-left: 3px solid var(--accent-2);
   background: rgba(167, 139, 250, 0.08);
   border-radius: 0 8px 8px 0;
-  color: #cfd2e0;
+  color: var(--quote);
 }
 .md blockquote p {
   margin: 0;
@@ -748,29 +947,37 @@ kbd {
   border-radius: 10px;
   overflow: hidden;
   border: 1px solid var(--line);
-  background: rgba(0, 0, 0, 0.35);
+  background: var(--codebg);
 }
 .code-head {
+  min-height: 30px;
+  line-height: 1;
   display: flex;
   justify-content: space-between;
   align-items: center;
   padding: 4px 10px;
-  background: rgba(255, 255, 255, 0.05);
+  background: var(--s1);
   font-size: 11px;
   color: var(--muted);
   text-transform: lowercase;
 }
 .copy {
   all: unset;
+  box-sizing: border-box;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  height: 22px;
+  line-height: 1;
   cursor: pointer;
   font-size: 11px;
-  padding: 2px 8px;
+  padding: 0 10px;
   border-radius: 6px;
   color: var(--text);
-  background: rgba(255, 255, 255, 0.08);
+  background: var(--s2);
 }
 .copy:hover {
-  background: rgba(255, 255, 255, 0.16);
+  background: var(--s3);
 }
 .code pre {
   margin: 0;
@@ -795,7 +1002,7 @@ kbd {
   width: 100%;
   border: 1px solid var(--line);
   border-radius: 9px;
-  background: rgba(0, 0, 0, 0.3);
+  background: var(--field);
   color: inherit;
   font: inherit;
   padding: 7px 10px;
@@ -819,14 +1026,14 @@ kbd {
   padding: 8px 10px;
   border-radius: 9px;
   font-weight: 600;
-  background: rgba(255, 255, 255, 0.05);
+  background: var(--s1);
 }
 .topic-head:hover {
-  background: rgba(255, 255, 255, 0.1);
+  background: var(--s3);
 }
 .topic-head.open {
   background: rgba(124, 131, 255, 0.16);
-  color: #c7caff;
+  color: var(--accent-text);
 }
 .count {
   font-size: 11px;
@@ -849,7 +1056,7 @@ kbd {
   border-radius: 8px;
 }
 .qitem:hover {
-  background: rgba(255, 255, 255, 0.08);
+  background: var(--s2);
 }
 .ready {
   font-size: 9px;
@@ -865,7 +1072,7 @@ kbd {
   margin: 8px 12px 0;
   padding: 3px;
   border-radius: 10px;
-  background: rgba(255, 255, 255, 0.05);
+  background: var(--s1);
 }
 .tabs button {
   all: unset;
@@ -895,7 +1102,7 @@ kbd {
   padding: 5px 12px;
   border-radius: 9px;
   font-size: 12.5px;
-  color: #c7caff;
+  color: var(--accent-text);
   background: rgba(124, 131, 255, 0.14);
   cursor: pointer;
 }
@@ -910,14 +1117,14 @@ kbd {
   flex-direction: column;
   gap: 8px;
   border-top: 1px solid var(--line);
-  background: rgba(255, 255, 255, 0.02);
+  background: var(--s1);
 }
 textarea,
 .model {
   width: 100%;
   border: 1px solid var(--line);
   border-radius: 9px;
-  background: rgba(0, 0, 0, 0.3);
+  background: var(--field);
   color: inherit;
   font: inherit;
   padding: 7px 10px;
@@ -930,7 +1137,7 @@ textarea:focus,
   border-color: var(--accent);
 }
 textarea::placeholder {
-  color: #5d6277;
+  color: var(--placeholder);
 }
 .row {
   display: flex;
@@ -957,10 +1164,10 @@ button.primary {
 }
 button.ghost {
   color: var(--text);
-  background: rgba(255, 255, 255, 0.08);
+  background: var(--s2);
 }
 button.ghost:hover:not(:disabled) {
-  background: rgba(255, 255, 255, 0.14);
+  background: var(--s3);
 }
 button.primary:hover:not(:disabled) {
   filter: brightness(1.1);
@@ -968,5 +1175,190 @@ button.primary:hover:not(:disabled) {
 button:disabled {
   opacity: 0.45;
   cursor: default;
+}
+
+/* выбор модели */
+.row {
+  flex-wrap: wrap;
+}
+.dd {
+  position: relative;
+  flex: 1;
+  min-width: 140px;
+}
+.model-btn {
+  all: unset;
+  box-sizing: border-box;
+  width: 100%;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 6px;
+  padding: 7px 10px;
+  border-radius: 9px;
+  border: 1px solid var(--line);
+  background: var(--field);
+  font-size: 12.5px;
+  color: var(--muted);
+  cursor: pointer;
+}
+.model-btn:hover {
+  border-color: var(--accent);
+}
+.model-name {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.dd-list {
+  position: absolute;
+  left: 0;
+  right: 0;
+  bottom: calc(100% + 4px);
+  max-height: 170px;
+  overflow-y: auto;
+  padding: 4px;
+  border-radius: 10px;
+  border: 1px solid var(--line);
+  background: var(--pop);
+  box-shadow: 0 8px 24px rgba(0, 0, 0, 0.35);
+  z-index: 20;
+}
+.dd-item {
+  all: unset;
+  box-sizing: border-box;
+  display: block;
+  width: 100%;
+  padding: 6px 10px;
+  border-radius: 7px;
+  font-size: 12.5px;
+  cursor: pointer;
+}
+.dd-item:hover {
+  background: var(--s2);
+}
+.dd-item.on {
+  color: var(--accent-text);
+  background: rgba(124, 131, 255, 0.16);
+}
+.dd-note {
+  padding: 6px 10px;
+  font-size: 11.5px;
+  color: var(--muted);
+}
+
+/* окно загрузки модели */
+.modal {
+  position: absolute;
+  inset: 0;
+  z-index: 30;
+  display: grid;
+  place-items: center;
+  padding: 14px;
+  background: rgba(0, 0, 0, 0.45);
+}
+.card {
+  width: 100%;
+  max-width: 440px;
+  max-height: 100%;
+  overflow-y: auto;
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  padding: 14px;
+  border-radius: 14px;
+  border: 1px solid var(--line);
+  background: var(--pop);
+  box-shadow: 0 12px 40px rgba(0, 0, 0, 0.45);
+}
+.card-head {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  font-weight: 650;
+  font-size: 15px;
+}
+.card-sub {
+  font-size: 12.5px;
+  line-height: 1.45;
+  color: var(--muted);
+}
+.card-sub code {
+  font-family: "Cascadia Code", Consolas, monospace;
+  font-size: 12px;
+  color: var(--icode);
+}
+.chips {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+}
+.chip {
+  all: unset;
+  box-sizing: border-box;
+  padding: 4px 10px;
+  border-radius: 99px;
+  font-size: 12px;
+  background: var(--s2);
+  cursor: pointer;
+}
+.chip:hover {
+  background: var(--s3);
+}
+.chip.on {
+  color: #fff;
+  background: var(--accent);
+}
+.card-msg {
+  font-size: 12.5px;
+  color: var(--accent-text);
+}
+.card-actions {
+  display: flex;
+  justify-content: flex-end;
+  gap: 8px;
+}
+.bar-progress {
+  height: 4px;
+  border-radius: 4px;
+  overflow: hidden;
+  background: var(--s2);
+}
+.bar-progress i {
+  display: block;
+  width: 40%;
+  height: 100%;
+  border-radius: 4px;
+  background: linear-gradient(90deg, var(--accent), var(--accent-2));
+  animation: slide 1.1s infinite ease-in-out;
+}
+@keyframes slide {
+  0% {
+    transform: translateX(-100%);
+  }
+  100% {
+    transform: translateX(260%);
+  }
+}
+
+/* светлая тема: поправки для акцентных цветов */
+.panel.light .error {
+  color: #b91c1c;
+  background: rgba(239, 68, 68, 0.12);
+}
+.panel.light .dualbtn {
+  color: #dc2626;
+}
+.panel.light .dualbtn.on {
+  color: #fff;
+}
+.panel.light .badge.red {
+  color: #b91c1c;
+}
+.panel.light .badge {
+  color: #b45309;
+}
+.panel.light .heard-text {
+  color: var(--text);
 }
 </style>
