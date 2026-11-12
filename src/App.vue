@@ -9,6 +9,7 @@ import "highlight.js/styles/github-dark.css";
 import { askModel } from "./lib/ai";
 import { renderMarkdown } from "./lib/markdown";
 import { DEMO_ANSWER, DEMO_QUESTION } from "./lib/demo";
+import { QUESTION_TOPICS, type QuestionItem } from "./data/questions";
 
 const appWindow = getCurrentWindow();
 
@@ -29,6 +30,47 @@ const clickThrough = ref(false);
 const input = ref<HTMLTextAreaElement | null>(null);
 
 const answerHtml = computed(() => (answer.value ? renderMarkdown(answer.value) : ""));
+
+// ---------- Список вопросов ----------
+const showList = ref(false);
+const openTopic = ref<string | null>(QUESTION_TOPICS[0]?.title ?? null);
+const filter = ref("");
+
+const filteredTopics = computed(() => {
+  const f = filter.value.trim().toLowerCase();
+  if (!f) return QUESTION_TOPICS;
+  return QUESTION_TOPICS.map((t) => ({
+    ...t,
+    items: t.items.filter(
+      (i) => i.title.toLowerCase().includes(f) || t.title.toLowerCase().includes(f),
+    ),
+  })).filter((t) => t.items.length > 0);
+});
+
+function toggleTopic(title: string) {
+  openTopic.value = openTopic.value === title ? null : title;
+}
+
+async function pickQuestion(item: QuestionItem) {
+  if (loading.value) return;
+  showList.value = false;
+  reset(item.q);
+  if (item.a) {
+    // готовый ответ показываем почти сразу
+    setTimeout(() => {
+      answer.value = item.a ?? "";
+      loading.value = false;
+    }, 250);
+    return;
+  }
+  try {
+    answer.value = await askModel(model.value, item.q);
+  } catch (e) {
+    error.value = String(e);
+  } finally {
+    loading.value = false;
+  }
+}
 
 watch(opacity, (v) => localStorage.setItem("sbs.opacity", String(v)));
 watch(model, (v) => localStorage.setItem("sbs.model", v));
@@ -299,7 +341,24 @@ onBeforeUnmount(() => {
     </header>
 
     <main class="body" @click="onAnswerClick">
-      <template v-if="heard">
+      <div v-if="showList" class="qlist">
+        <input v-model="filter" class="search" placeholder="Поиск по вопросам…" spellcheck="false" />
+        <div v-for="t in filteredTopics" :key="t.title" class="topic">
+          <button class="topic-head" :class="{ open: openTopic === t.title || filter }" @click="toggleTopic(t.title)">
+            <span>{{ t.title }}</span>
+            <span class="count">{{ t.items.length }}</span>
+          </button>
+          <div v-if="openTopic === t.title || filter" class="topic-items">
+            <button v-for="i in t.items" :key="i.title" class="qitem" @click="pickQuestion(i)">
+              {{ i.title }}
+              <span v-if="i.a" class="ready" title="Готовый ответ">●</span>
+            </button>
+          </div>
+        </div>
+        <div v-if="!filteredTopics.length" class="hint-small">Ничего не найдено</div>
+      </div>
+
+      <template v-else-if="heard">
         <div class="heard">
           <div class="label">Студент спрашивает</div>
           <div class="heard-text">{{ heard }}</div>
@@ -333,6 +392,7 @@ onBeforeUnmount(() => {
       />
       <div class="row">
         <input v-model="model" class="model" spellcheck="false" title="Модель Ollama" />
+        <button class="ghost" :class="{ active: showList }" @click="showList = !showList">☰ Вопросы</button>
         <button class="ghost" :disabled="loading" @click="runDemo">▶ Тест</button>
         <button class="primary" :disabled="loading || !draft.trim()" @click="ask">Спросить</button>
       </div>
@@ -697,6 +757,85 @@ kbd {
   font-family: "Cascadia Code", Consolas, monospace;
   font-size: 12.5px;
   line-height: 1.5;
+}
+
+/* список вопросов */
+.qlist {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+.search {
+  width: 100%;
+  border: 1px solid var(--line);
+  border-radius: 9px;
+  background: rgba(0, 0, 0, 0.3);
+  color: inherit;
+  font: inherit;
+  padding: 7px 10px;
+  outline: none;
+  margin-bottom: 4px;
+}
+.search:focus {
+  border-color: var(--accent);
+}
+.topic-head,
+.qitem {
+  all: unset;
+  box-sizing: border-box;
+  width: 100%;
+  cursor: pointer;
+}
+.topic-head {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  padding: 8px 10px;
+  border-radius: 9px;
+  font-weight: 600;
+  background: rgba(255, 255, 255, 0.05);
+}
+.topic-head:hover {
+  background: rgba(255, 255, 255, 0.1);
+}
+.topic-head.open {
+  background: rgba(124, 131, 255, 0.16);
+  color: #c7caff;
+}
+.count {
+  font-size: 11px;
+  font-weight: 500;
+  color: var(--muted);
+}
+.topic-items {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  padding: 4px 0 4px 10px;
+  margin-left: 6px;
+  border-left: 2px solid rgba(124, 131, 255, 0.35);
+}
+.qitem {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  padding: 6px 10px;
+  border-radius: 8px;
+}
+.qitem:hover {
+  background: rgba(255, 255, 255, 0.08);
+}
+.ready {
+  font-size: 9px;
+  color: #34d399;
+}
+.hint-small {
+  color: var(--muted);
+  padding: 8px 4px;
+}
+button.ghost.active {
+  background: rgba(124, 131, 255, 0.28);
+  color: #fff;
 }
 
 /* низ */

@@ -1,14 +1,14 @@
 //! Режим «два курсора» для Windows.
 //!
-//! При включении системный курсор плавно уезжает в центр экрана и замораживается:
+//! При включении системный курсор плавно уезжает в случайную точку возле центра экрана и замораживается:
 //! хук WH_MOUSE_LL съедает все события мыши. Сдвиг мыши считается как отклонение
 //! от центра (после каждого движения курсор возвращается в центр), клики и колесо
 //! уходят в интерфейс, где ими управляется красный курсор внутри окна-подсказки.
 
 use std::ptr::null_mut;
-use std::sync::atomic::{AtomicBool, AtomicI32, AtomicIsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI32, AtomicIsize, AtomicU64, Ordering};
 use std::sync::OnceLock;
-use std::time::Duration;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use serde::Serialize;
 use windows_sys::Win32::Foundation::{HWND, LPARAM, LRESULT, POINT, WPARAM};
@@ -70,25 +70,50 @@ pub fn init(emit_fn: Box<dyn Fn(VEvent) + Send + Sync>) {
     });
 }
 
-/// Центр монитора, на котором сейчас находится курсор.
-fn monitor_center(from: POINT) -> (i32, i32) {
+static RNG: AtomicU64 = AtomicU64::new(0);
+
+/// Случайное число от 0 до 1 (xorshift, хватает для разброса курсора).
+fn rand01() -> f64 {
+    let mut x = RNG.load(Ordering::Relaxed);
+    if x == 0 {
+        x = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|d| d.as_nanos() as u64)
+            .unwrap_or(88172645463325252)
+            | 1;
+    }
+    x ^= x << 13;
+    x ^= x >> 7;
+    x ^= x << 17;
+    RNG.store(x, Ordering::Relaxed);
+    (x >> 11) as f64 / (1u64 << 53) as f64
+}
+
+/// Случайная точка возле центра монитора, на котором сейчас курсор:
+/// каждый раз новая, в пределах ±22% ширины и высоты от центра.
+fn random_center(from: POINT) -> (i32, i32) {
     unsafe {
         let mon = MonitorFromPoint(from, MONITOR_DEFAULTTONEAREST);
         let mut info: MONITORINFO = std::mem::zeroed();
         info.cbSize = std::mem::size_of::<MONITORINFO>() as u32;
         if GetMonitorInfoW(mon, &mut info) != 0 {
             let r = info.rcMonitor;
-            return ((r.left + r.right) / 2, (r.top + r.bottom) / 2);
+            let (w, h) = ((r.right - r.left) as f64, (r.bottom - r.top) as f64);
+            let cx = (r.left + r.right) as f64 / 2.0;
+            let cy = (r.top + r.bottom) as f64 / 2.0;
+            let x = cx + (rand01() * 2.0 - 1.0) * w * 0.22;
+            let y = cy + (rand01() * 2.0 - 1.0) * h * 0.22;
+            return (x.round() as i32, y.round() as i32);
         }
     }
     (from.x, from.y)
 }
 
-/// Плавно двигает системный курсор в центр монитора и после этого «включает» отсчёт сдвигов.
+/// Плавно двигает системный курсор в случайную точку возле центра монитора и после этого «включает» отсчёт сдвигов.
 fn glide_to_center(epoch: i32) {
     let mut start = POINT { x: 0, y: 0 };
     unsafe { GetCursorPos(&mut start) };
-    let (tx, ty) = monitor_center(start);
+    let (tx, ty) = random_center(start);
     CX.store(tx, Ordering::SeqCst);
     CY.store(ty, Ordering::SeqCst);
 
