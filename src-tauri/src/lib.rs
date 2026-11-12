@@ -1,3 +1,6 @@
+#[cfg(windows)]
+mod vcursor_win;
+
 use serde::{Deserialize, Serialize};
 
 const OLLAMA_URL: &str = "http://127.0.0.1:11434/api/chat";
@@ -52,6 +55,22 @@ async fn ask_ollama(model: String, system: String, question: String) -> Result<S
     Ok(parsed.message.content)
 }
 
+/// Включает/выключает режим «два курсора»: системная мышь замораживается,
+/// а движения и клики уходят в интерфейс (событие `vcursor`).
+#[tauri::command]
+fn set_virtual_cursor(window: tauri::WebviewWindow, active: bool) -> Result<(), String> {
+    #[cfg(windows)]
+    {
+        let own = window.hwnd().map_err(|e| e.to_string())?.0 as isize;
+        vcursor_win::set_active(active, own);
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = (window, active);
+    }
+    Ok(())
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     let mut builder = tauri::Builder::default();
@@ -62,7 +81,20 @@ pub fn run() {
     }
 
     builder
-        .invoke_handler(tauri::generate_handler![ask_ollama])
+        .setup(|app| {
+            #[cfg(windows)]
+            {
+                use tauri::Emitter;
+                let handle = app.handle().clone();
+                vcursor_win::init(Box::new(move |ev| {
+                    let _ = handle.emit("vcursor", ev);
+                }));
+            }
+            #[cfg(not(windows))]
+            let _ = app;
+            Ok(())
+        })
+        .invoke_handler(tauri::generate_handler![ask_ollama, set_virtual_cursor])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
 }

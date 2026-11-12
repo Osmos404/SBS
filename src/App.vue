@@ -2,6 +2,8 @@
 import { computed, onBeforeUnmount, onMounted, ref, watch } from "vue";
 import { getCurrentWindow } from "@tauri-apps/api/window";
 import { LogicalPosition } from "@tauri-apps/api/dpi";
+import { invoke } from "@tauri-apps/api/core";
+import { listen, type UnlistenFn } from "@tauri-apps/api/event";
 import { register, unregister } from "@tauri-apps/plugin-global-shortcut";
 import "highlight.js/styles/github-dark.css";
 import { askModel } from "./lib/ai";
@@ -14,6 +16,7 @@ const HOTKEY_TOGGLE = "CommandOrControl+Alt+H";
 const HOTKEY_CLICKTHROUGH = "CommandOrControl+Alt+C";
 const HOTKEY_FOCUS = "CommandOrControl+Alt+Space";
 const HOTKEY_QUIT = "CommandOrControl+Alt+Q";
+const HOTKEY_DUAL = "CommandOrControl+Alt+X";
 
 const opacity = ref(Number(localStorage.getItem("sbs.opacity") ?? 0.88));
 const model = ref(localStorage.getItem("sbs.model") ?? "qwen2.5:7b");
@@ -66,8 +69,95 @@ function runDemo() {
 const ptr = ref({ x: -100, y: -100, show: false });
 
 function onPointerMove(e: PointerEvent) {
+  if (dual.value) return;
   ptr.value = { x: e.clientX, y: e.clientY, show: true };
   moveDrag(e);
+}
+
+function onPointerLeave() {
+  if (!dual.value) ptr.value.show = false;
+}
+
+// ---------- Режим «два курсора» ----------
+// Системный курсор остаётся на месте (его видят зрители), а мышь управляет
+// красным курсором, который живёт только внутри окна-подсказки.
+const dual = ref(false);
+const SENSITIVITY = 1.3;
+let unlistenV: UnlistenFn | null = null;
+let vDownTarget: HTMLElement | null = null;
+let vSlider: HTMLInputElement | null = null;
+
+interface VEvent {
+  kind: "move" | "down" | "up" | "wheel";
+  dx: number;
+  dy: number;
+  button: number;
+  delta: number;
+}
+
+function elementAtPointer(): HTMLElement | null {
+  return document.elementFromPoint(ptr.value.x, ptr.value.y) as HTMLElement | null;
+}
+
+function setSliderFromPointer(el: HTMLInputElement) {
+  const r = el.getBoundingClientRect();
+  const min = Number(el.min || 0);
+  const max = Number(el.max || 100);
+  const step = Number(el.step || 1);
+  const t = Math.min(1, Math.max(0, (ptr.value.x - r.left) / r.width));
+  const raw = min + t * (max - min);
+  el.value = String(Math.round(raw / step) * step);
+  el.dispatchEvent(new Event("input", { bubbles: true }));
+}
+
+function onVirtualEvent(p: VEvent) {
+  if (!dual.value) return;
+  if (p.kind === "move") {
+    ptr.value = {
+      x: Math.min(window.innerWidth - 1, Math.max(0, ptr.value.x + p.dx * SENSITIVITY)),
+      y: Math.min(window.innerHeight - 1, Math.max(0, ptr.value.y + p.dy * SENSITIVITY)),
+      show: true,
+    };
+    if (vSlider) setSliderFromPointer(vSlider);
+  } else if (p.kind === "down" && p.button === 0) {
+    const el = elementAtPointer();
+    vDownTarget = el;
+    if (el instanceof HTMLInputElement && el.type === "range") {
+      vSlider = el;
+      setSliderFromPointer(el);
+    } else if (el instanceof HTMLTextAreaElement || (el instanceof HTMLInputElement && el.type === "text")) {
+      el.focus();
+    }
+  } else if (p.kind === "up" && p.button === 0) {
+    vSlider = null;
+    const el = elementAtPointer();
+    const btn = el?.closest("button");
+    // «клик» засчитываем, только если отпустили над той же кнопкой, где нажали
+    if (btn && vDownTarget?.closest("button") === btn) btn.click();
+    vDownTarget = null;
+  } else if (p.kind === "wheel") {
+    const body = document.querySelector<HTMLElement>(".body");
+    if (body) body.scrollTop -= (p.delta / 120) * 60;
+  }
+}
+
+async function setDual(on: boolean) {
+  if (on === dual.value) return;
+  if (on) {
+    // сначала включаем режим (Rust запоминает окно, из которого пришли), потом забираем фокус
+    await invoke("set_virtual_cursor", { active: true });
+    dual.value = true;
+    await appWindow.show();
+    await setClickThrough(false);
+    await appWindow.setFocus();
+    ptr.value = { x: window.innerWidth / 2, y: window.innerHeight / 2, show: true };
+  } else {
+    dual.value = false;
+    vSlider = null;
+    vDownTarget = null;
+    ptr.value.show = false;
+    await invoke("set_virtual_cursor", { active: false });
+  }
 }
 
 // Перемещение окна вручную (а не штатным перетаскиванием Windows),
@@ -76,7 +166,7 @@ let drag: { sx: number; sy: number; wx: number; wy: number } | null = null;
 let raf = 0;
 
 async function startDrag(e: PointerEvent) {
-  if ((e.target as HTMLElement).closest("input,label,.close")) return;
+  if ((e.target as HTMLElement).closest("input,label,button")) return;
   (e.currentTarget as HTMLElement).setPointerCapture(e.pointerId);
   const [scale, pos] = await Promise.all([appWindow.scaleFactor(), appWindow.outerPosition()]);
   drag = { sx: e.screenX, sy: e.screenY, wx: pos.x / scale, wy: pos.y / scale };
@@ -143,6 +233,8 @@ onMounted(async () => {
   );
   await register(HOTKEY_FOCUS, (e) => e.state === "Pressed" && focusInput());
   await register(HOTKEY_QUIT, (e) => e.state === "Pressed" && quit());
+  await register(HOTKEY_DUAL, (e) => e.state === "Pressed" && setDual(!dual.value));
+  unlistenV = await listen<VEvent>("vcursor", (e) => onVirtualEvent(e.payload));
 });
 
 onBeforeUnmount(() => {
@@ -150,15 +242,19 @@ onBeforeUnmount(() => {
   unregister(HOTKEY_CLICKTHROUGH);
   unregister(HOTKEY_FOCUS);
   unregister(HOTKEY_QUIT);
+  unregister(HOTKEY_DUAL);
+  unlistenV?.();
+  if (dual.value) invoke("set_virtual_cursor", { active: false });
 });
 </script>
 
 <template>
   <div
     class="panel"
+    :class="{ dual }"
     :style="{ '--op': opacity }"
     @pointermove="onPointerMove"
-    @pointerleave="ptr.show = false"
+    @pointerleave="onPointerLeave"
   >
     <header class="bar" @pointerdown="startDrag" @pointerup="endDrag" @pointercancel="endDrag">
       <div class="brand">
@@ -169,7 +265,19 @@ onBeforeUnmount(() => {
         </span>
         <span class="title">SBS</span>
         <span v-if="clickThrough" class="badge">сквозной режим</span>
+        <span v-if="dual" class="badge red">красный курсор</span>
       </div>
+      <button
+        class="dualbtn"
+        :class="{ on: dual }"
+        title="Два курсора: мышь управляет красным курсором в окне (Ctrl+Alt+X)"
+        @click="setDual(!dual)"
+      >
+        <svg viewBox="0 0 24 24" width="13" height="13">
+          <path d="M4 2v18l4.5-4.5L12 22l3-1.5-3.5-6.5H18z" fill="currentColor" />
+        </svg>
+        2 курсора
+      </button>
       <label class="slider" title="Прозрачность окна">
         <svg viewBox="0 0 24 24" width="14" height="14" fill="currentColor">
           <path d="M12 3.5c3.6 4.2 6 7.3 6 10.5a6 6 0 0 1-12 0c0-3.2 2.4-6.3 6-10.5Z" />
@@ -202,6 +310,7 @@ onBeforeUnmount(() => {
           <span><kbd>Ctrl</kbd><kbd>Alt</kbd><kbd>Space</kbd> ввод</span>
           <span><kbd>Ctrl</kbd><kbd>Alt</kbd><kbd>H</kbd> скрыть</span>
           <span><kbd>Ctrl</kbd><kbd>Alt</kbd><kbd>C</kbd> сквозной режим</span>
+          <span><kbd>Ctrl</kbd><kbd>Alt</kbd><kbd>X</kbd> два курсора</span>
           <span><kbd>Ctrl</kbd><kbd>Alt</kbd><kbd>Q</kbd> закрыть</span>
         </div>
       </div>
@@ -340,8 +449,35 @@ body {
   background: rgba(245, 158, 11, 0.18);
   color: #fbbf24;
 }
-.slider {
+.dualbtn {
+  all: unset;
   margin-left: auto;
+  margin-right: 10px;
+  display: flex;
+  align-items: center;
+  gap: 5px;
+  font-size: 11.5px;
+  padding: 3px 9px;
+  border-radius: 99px;
+  color: #fca5a5;
+  background: rgba(239, 68, 68, 0.12);
+  transition: background 0.15s;
+}
+.dualbtn:hover {
+  background: rgba(239, 68, 68, 0.25);
+}
+.dualbtn.on {
+  color: #fff;
+  background: #ef4444;
+}
+.badge.red {
+  background: rgba(239, 68, 68, 0.2);
+  color: #fca5a5;
+}
+.panel.dual {
+  border-color: rgba(239, 68, 68, 0.6);
+}
+.slider {
   margin-right: 10px;
   display: flex;
   align-items: center;
