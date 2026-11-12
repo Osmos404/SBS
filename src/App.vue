@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { computed, onBeforeUnmount, onMounted, ref, watch } from "vue";
+import { computed, onBeforeUnmount, onMounted, reactive, ref, watch } from "vue";
 import { getCurrentWindow } from "@tauri-apps/api/window";
 import { LogicalPosition } from "@tauri-apps/api/dpi";
 import { invoke } from "@tauri-apps/api/core";
@@ -18,21 +18,31 @@ const HOTKEY_CLICKTHROUGH = "CommandOrControl+Alt+C";
 const HOTKEY_FOCUS = "CommandOrControl+Alt+Space";
 const HOTKEY_QUIT = "CommandOrControl+Alt+Q";
 const HOTKEY_DUAL = "CommandOrControl+Alt+X";
+const HOTKEY_MODE = "CommandOrControl+Alt+M";
 
 const opacity = ref(Number(localStorage.getItem("sbs.opacity") ?? 0.88));
 const model = ref(localStorage.getItem("sbs.model") ?? "qwen2.5:7b");
 const draft = ref("");
-const heard = ref("");
-const answer = ref("");
-const error = ref("");
-const loading = ref(false);
 const clickThrough = ref(false);
+
+// Два режима: «ИИ» (свободный вопрос) и «Вопросы» (готовый список). У каждого свой экран ответа.
+type Mode = "ai" | "questions";
+interface View {
+  heard: string;
+  answer: string;
+  error: string;
+  loading: boolean;
+}
+const mode = ref<Mode>((localStorage.getItem("sbs.mode") as Mode) === "questions" ? "questions" : "ai");
+const ai = reactive<View>({ heard: "", answer: "", error: "", loading: false });
+const qa = reactive<View>({ heard: "", answer: "", error: "", loading: false });
+const qView = ref<"list" | "answer">("list");
+const cur = computed(() => (mode.value === "ai" ? ai : qa));
 const input = ref<HTMLTextAreaElement | null>(null);
 
-const answerHtml = computed(() => (answer.value ? renderMarkdown(answer.value) : ""));
+const answerHtml = computed(() => (cur.value.answer ? renderMarkdown(cur.value.answer) : ""));
 
 // ---------- Список вопросов ----------
-const showList = ref(false);
 const openTopic = ref<string | null>(QUESTION_TOPICS[0]?.title ?? null);
 const filter = ref("");
 
@@ -52,57 +62,65 @@ function toggleTopic(title: string) {
 }
 
 async function pickQuestion(item: QuestionItem) {
-  if (loading.value) return;
-  showList.value = false;
-  reset(item.q);
+  if (qa.loading) return;
+  qView.value = "answer";
+  reset(qa, item.q);
   if (item.a) {
     // готовый ответ показываем почти сразу
     setTimeout(() => {
-      answer.value = item.a ?? "";
-      loading.value = false;
+      qa.answer = item.a ?? "";
+      qa.loading = false;
     }, 250);
     return;
   }
-  try {
-    answer.value = await askModel(model.value, item.q);
-  } catch (e) {
-    error.value = String(e);
-  } finally {
-    loading.value = false;
-  }
+  await query(qa, item.q);
+}
+
+function backToList() {
+  qView.value = "list";
+}
+
+function setMode(m: Mode) {
+  mode.value = m;
 }
 
 watch(opacity, (v) => localStorage.setItem("sbs.opacity", String(v)));
 watch(model, (v) => localStorage.setItem("sbs.model", v));
+watch(mode, (v) => localStorage.setItem("sbs.mode", v));
 
-function reset(question: string) {
-  heard.value = question;
-  answer.value = "";
-  error.value = "";
-  loading.value = true;
+function reset(v: View, question: string) {
+  v.heard = question;
+  v.answer = "";
+  v.error = "";
+  v.loading = true;
+}
+
+async function query(v: View, question: string) {
+  try {
+    v.answer = await askModel(model.value, question);
+  } catch (e) {
+    v.error = String(e);
+  } finally {
+    v.loading = false;
+  }
 }
 
 async function ask() {
   const q = draft.value.trim();
-  if (!q || loading.value) return;
+  if (!q || ai.loading) return;
   draft.value = "";
-  reset(q);
-  try {
-    answer.value = await askModel(model.value, q);
-  } catch (e) {
-    error.value = String(e);
-  } finally {
-    loading.value = false;
-  }
+  reset(ai, q);
+  await query(ai, q);
 }
 
 // Тест: имитируем, что приложение услышало вопрос студента и подготовило ответ.
 function runDemo() {
-  if (loading.value) return;
-  reset(DEMO_QUESTION);
+  if (ai.loading) return;
+  mode.value = "ai";
+  reset(ai, DEMO_QUESTION);
   setTimeout(() => {
-    answer.value = DEMO_ANSWER;
-    loading.value = false;
+    ai.answer = DEMO_ANSWER;
+    ai.loading = false;
   }, 900);
 }
 
@@ -284,6 +302,7 @@ onMounted(async () => {
   await safeRegister(HOTKEY_FOCUS, focusInput);
   await safeRegister(HOTKEY_QUIT, quit);
   await safeRegister(HOTKEY_DUAL, () => setDual(!dual.value));
+  await safeRegister(HOTKEY_MODE, () => setMode(mode.value === "ai" ? "questions" : "ai"));
 });
 
 onBeforeUnmount(() => {
@@ -292,6 +311,7 @@ onBeforeUnmount(() => {
   unregister(HOTKEY_FOCUS);
   unregister(HOTKEY_QUIT);
   unregister(HOTKEY_DUAL);
+  unregister(HOTKEY_MODE);
   unlistenV?.();
   if (dual.value) invoke("set_virtual_cursor", { active: false });
 });
@@ -340,8 +360,13 @@ onBeforeUnmount(() => {
       </button>
     </header>
 
+    <nav class="tabs">
+      <button :class="{ on: mode === 'ai' }" @click="setMode('ai')">ИИ</button>
+      <button :class="{ on: mode === 'questions' }" @click="setMode('questions')">Вопросы</button>
+    </nav>
+
     <main class="body" @click="onAnswerClick">
-      <div v-if="showList" class="qlist">
+      <div v-if="mode === 'questions' && qView === 'list'" class="qlist">
         <input v-model="filter" class="search" placeholder="Поиск по вопросам…" spellcheck="false" />
         <div v-for="t in filteredTopics" :key="t.title" class="topic">
           <button class="topic-head" :class="{ open: openTopic === t.title || filter }" @click="toggleTopic(t.title)">
@@ -358,14 +383,15 @@ onBeforeUnmount(() => {
         <div v-if="!filteredTopics.length" class="hint-small">Ничего не найдено</div>
       </div>
 
-      <template v-else-if="heard">
+      <template v-else-if="cur.heard">
+        <button v-if="mode === 'questions'" class="back" @click="backToList">← Назад к вопросам</button>
         <div class="heard">
           <div class="label">Студент спрашивает</div>
-          <div class="heard-text">{{ heard }}</div>
+          <div class="heard-text">{{ cur.heard }}</div>
         </div>
 
-        <div v-if="loading" class="thinking"><i /><i /><i /></div>
-        <div v-else-if="error" class="error">{{ error }}</div>
+        <div v-if="cur.loading" class="thinking"><i /><i /><i /></div>
+        <div v-else-if="cur.error" class="error">{{ cur.error }}</div>
         <div v-else class="answer md" v-html="answerHtml" />
       </template>
 
@@ -377,12 +403,13 @@ onBeforeUnmount(() => {
           <span><kbd>Ctrl</kbd><kbd>Alt</kbd><kbd>H</kbd> скрыть</span>
           <span><kbd>Ctrl</kbd><kbd>Alt</kbd><kbd>C</kbd> сквозной режим</span>
           <span><kbd>Ctrl</kbd><kbd>Alt</kbd><kbd>X</kbd> два курсора</span>
+          <span><kbd>Ctrl</kbd><kbd>Alt</kbd><kbd>M</kbd> ИИ / вопросы</span>
           <span><kbd>Ctrl</kbd><kbd>Alt</kbd><kbd>Q</kbd> закрыть</span>
         </div>
       </div>
     </main>
 
-    <footer class="foot">
+    <footer v-if="mode === 'ai'" class="foot">
       <textarea
         ref="input"
         v-model="draft"
@@ -392,9 +419,8 @@ onBeforeUnmount(() => {
       />
       <div class="row">
         <input v-model="model" class="model" spellcheck="false" title="Модель Ollama" />
-        <button class="ghost" :class="{ active: showList }" @click="showList = !showList">☰ Вопросы</button>
-        <button class="ghost" :disabled="loading" @click="runDemo">▶ Тест</button>
-        <button class="primary" :disabled="loading || !draft.trim()" @click="ask">Спросить</button>
+        <button class="ghost" :disabled="ai.loading" @click="runDemo">▶ Тест</button>
+        <button class="primary" :disabled="ai.loading || !draft.trim()" @click="ask">Спросить</button>
       </div>
     </footer>
 
@@ -833,9 +859,48 @@ kbd {
   color: var(--muted);
   padding: 8px 4px;
 }
-button.ghost.active {
-  background: rgba(124, 131, 255, 0.28);
+.tabs {
+  display: flex;
+  gap: 4px;
+  margin: 8px 12px 0;
+  padding: 3px;
+  border-radius: 10px;
+  background: rgba(255, 255, 255, 0.05);
+}
+.tabs button {
+  all: unset;
+  flex: 1;
+  text-align: center;
+  padding: 5px 0;
+  border-radius: 8px;
+  font-weight: 600;
+  font-size: 13px;
+  color: var(--muted);
+  cursor: pointer;
+  transition: background 0.15s, color 0.15s;
+}
+.tabs button:hover {
+  color: var(--text);
+}
+.tabs button.on {
   color: #fff;
+  background: linear-gradient(135deg, var(--accent), var(--accent-2));
+}
+.back {
+  all: unset;
+  box-sizing: border-box;
+  display: inline-flex;
+  align-items: center;
+  margin-bottom: 10px;
+  padding: 5px 12px;
+  border-radius: 9px;
+  font-size: 12.5px;
+  color: #c7caff;
+  background: rgba(124, 131, 255, 0.14);
+  cursor: pointer;
+}
+.back:hover {
+  background: rgba(124, 131, 255, 0.26);
 }
 
 /* низ */
