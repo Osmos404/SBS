@@ -1,6 +1,7 @@
 <script setup lang="ts">
 import { computed, onBeforeUnmount, onMounted, ref, watch } from "vue";
 import { getCurrentWindow } from "@tauri-apps/api/window";
+import { LogicalPosition } from "@tauri-apps/api/dpi";
 import { register, unregister } from "@tauri-apps/plugin-global-shortcut";
 import "highlight.js/styles/github-dark.css";
 import { askModel } from "./lib/ai";
@@ -60,6 +61,43 @@ function runDemo() {
   }, 900);
 }
 
+// Свой красный курсор: системный курсор над окном скрыт (его видно в демонстрации),
+// а наш рисуется внутри окна, которое в демонстрацию не попадает.
+const ptr = ref({ x: -100, y: -100, show: false });
+
+function onPointerMove(e: PointerEvent) {
+  ptr.value = { x: e.clientX, y: e.clientY, show: true };
+  moveDrag(e);
+}
+
+// Перемещение окна вручную (а не штатным перетаскиванием Windows),
+// чтобы системный курсор оставался скрытым и в демонстрации его не было.
+let drag: { sx: number; sy: number; wx: number; wy: number } | null = null;
+let raf = 0;
+
+async function startDrag(e: PointerEvent) {
+  if ((e.target as HTMLElement).closest("input,label,.close")) return;
+  (e.currentTarget as HTMLElement).setPointerCapture(e.pointerId);
+  const [scale, pos] = await Promise.all([appWindow.scaleFactor(), appWindow.outerPosition()]);
+  drag = { sx: e.screenX, sy: e.screenY, wx: pos.x / scale, wy: pos.y / scale };
+}
+
+function moveDrag(e: PointerEvent) {
+  if (!drag || raf) return;
+  const d = drag;
+  const x = d.wx + e.screenX - d.sx;
+  const y = d.wy + e.screenY - d.sy;
+  raf = requestAnimationFrame(() => {
+    raf = 0;
+    appWindow.setPosition(new LogicalPosition(x, y));
+  });
+}
+
+function endDrag(e: PointerEvent) {
+  drag = null;
+  (e.currentTarget as HTMLElement).releasePointerCapture?.(e.pointerId);
+}
+
 function onKey(e: KeyboardEvent) {
   if (e.key === "Enter" && !e.shiftKey) {
     e.preventDefault();
@@ -116,11 +154,20 @@ onBeforeUnmount(() => {
 </script>
 
 <template>
-  <div class="panel" :style="{ '--op': opacity }">
-    <header data-tauri-drag-region class="bar">
-      <div data-tauri-drag-region class="brand">
-        <span class="dot" />
-        <span data-tauri-drag-region class="title">SBS</span>
+  <div
+    class="panel"
+    :style="{ '--op': opacity }"
+    @pointermove="onPointerMove"
+    @pointerleave="ptr.show = false"
+  >
+    <header class="bar" @pointerdown="startDrag" @pointerup="endDrag" @pointercancel="endDrag">
+      <div class="brand">
+        <span class="grip" title="Потяните, чтобы переместить окно">
+          <svg viewBox="0 0 24 24" width="16" height="16">
+            <path d="M4 2v18l4.5-4.5L12 22l3-1.5-3.5-6.5H18z" fill="#ef4444" stroke="#fff" stroke-width="1.2" stroke-linejoin="round" />
+          </svg>
+        </span>
+        <span class="title">SBS</span>
         <span v-if="clickThrough" class="badge">сквозной режим</span>
       </div>
       <label class="slider" title="Прозрачность окна">
@@ -174,6 +221,17 @@ onBeforeUnmount(() => {
         <button class="primary" :disabled="loading || !draft.trim()" @click="ask">Спросить</button>
       </div>
     </footer>
+
+    <svg
+      v-show="ptr.show"
+      class="ptr"
+      viewBox="0 0 24 24"
+      width="20"
+      height="20"
+      :style="{ transform: `translate(${ptr.x - 4}px, ${ptr.y - 2}px)` }"
+    >
+      <path d="M4 2v18l4.5-4.5L12 22l3-1.5-3.5-6.5H18z" fill="#ef4444" stroke="#fff" stroke-width="1.2" stroke-linejoin="round" />
+    </svg>
   </div>
 </template>
 
@@ -230,8 +288,32 @@ body {
   justify-content: space-between;
   padding: 8px 12px;
   border-bottom: 1px solid var(--line);
-  cursor: move;
   user-select: none;
+  touch-action: none;
+}
+.grip {
+  display: grid;
+  place-items: center;
+  width: 24px;
+  height: 24px;
+  border-radius: 7px;
+  background: rgba(239, 68, 68, 0.12);
+}
+.grip:hover {
+  background: rgba(239, 68, 68, 0.25);
+}
+/* системный курсор скрыт, вместо него рисуется красный (см. .ptr) */
+.panel,
+.panel * {
+  cursor: none !important;
+}
+.ptr {
+  position: fixed;
+  left: 0;
+  top: 0;
+  pointer-events: none;
+  z-index: 9999;
+  filter: drop-shadow(0 1px 2px rgba(0, 0, 0, 0.5));
 }
 .brand {
   flex: 1;
