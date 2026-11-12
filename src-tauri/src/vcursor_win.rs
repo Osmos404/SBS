@@ -1,31 +1,32 @@
 //! Режим «два курсора» для Windows.
 //!
-//! Когда режим включён, системная мышь «замораживается» (хук WH_MOUSE_LL съедает все
-//! события мыши), а движения и клики читаются через Raw Input и отправляются
-//! в интерфейс, где ими управляется красный курсор внутри окна-подсказки.
+//! При включении системный курсор плавно уезжает в центр экрана и замораживается:
+//! хук WH_MOUSE_LL съедает все события мыши. Сдвиг мыши считается как отклонение
+//! от центра (после каждого движения курсор возвращается в центр), клики и колесо
+//! уходят в интерфейс, где ими управляется красный курсор внутри окна-подсказки.
 
-use std::mem::size_of;
-use std::ptr::{null, null_mut};
+use std::ptr::null_mut;
 use std::sync::atomic::{AtomicBool, AtomicI32, AtomicIsize, Ordering};
 use std::sync::OnceLock;
+use std::time::Duration;
 
 use serde::Serialize;
-use windows_sys::Win32::Foundation::{HWND, LPARAM, LRESULT, WPARAM};
-use windows_sys::Win32::System::LibraryLoader::GetModuleHandleW;
-use windows_sys::Win32::UI::Input::{
-    GetRawInputData, RegisterRawInputDevices, HRAWINPUT, RAWINPUT, RAWINPUTDEVICE,
-    RAWINPUTHEADER, RIDEV_INPUTSINK, RID_INPUT, RIM_TYPEMOUSE,
+use windows_sys::Win32::Foundation::{HWND, LPARAM, LRESULT, POINT, WPARAM};
+use windows_sys::Win32::Graphics::Gdi::{
+    GetMonitorInfoW, MonitorFromPoint, MONITORINFO, MONITOR_DEFAULTTONEAREST,
 };
 use windows_sys::Win32::UI::WindowsAndMessaging::{
-    CallNextHookEx, CreateWindowExW, DefWindowProcW, DispatchMessageW, GetForegroundWindow,
-    GetMessageW, RegisterClassW, SetForegroundWindow, SetTimer, SetWindowsHookExW,
-    TranslateMessage, HWND_MESSAGE, MSG, WH_MOUSE_LL, WM_INPUT, WM_TIMER, WNDCLASSW,
+    CallNextHookEx, DispatchMessageW, GetCursorPos, GetForegroundWindow, GetMessageW,
+    SetCursorPos, SetForegroundWindow, SetWindowsHookExW, TranslateMessage, MSG,
+    MSLLHOOKSTRUCT, WH_MOUSE_LL,
 };
 
-/// Строка в UTF-16 с завершающим нулём.
-fn wide(s: &str) -> Vec<u16> {
-    s.encode_utf16().chain(std::iter::once(0)).collect()
-}
+const WM_MOUSEMOVE: u32 = 0x0200;
+const WM_LBUTTONDOWN: u32 = 0x0201;
+const WM_LBUTTONUP: u32 = 0x0202;
+const WM_RBUTTONDOWN: u32 = 0x0204;
+const WM_RBUTTONUP: u32 = 0x0205;
+const WM_MOUSEWHEEL: u32 = 0x020A;
 
 #[derive(Serialize, Clone, Debug)]
 pub struct VEvent {
@@ -38,7 +39,14 @@ pub struct VEvent {
     pub delta: i32,
 }
 
+/// Режим включён: мышь перехватывается.
 static ACTIVE: AtomicBool = AtomicBool::new(false);
+/// Курсор доехал до центра, можно считать сдвиги.
+static READY: AtomicBool = AtomicBool::new(false);
+/// Номер включения: старая анимация прекращается, если режим переключили заново.
+static EPOCH: AtomicI32 = AtomicI32::new(0);
+static CX: AtomicI32 = AtomicI32::new(0);
+static CY: AtomicI32 = AtomicI32::new(0);
 static DX: AtomicI32 = AtomicI32::new(0);
 static DY: AtomicI32 = AtomicI32::new(0);
 static SAVED_FG: AtomicIsize = AtomicIsize::new(0);
@@ -50,157 +58,141 @@ fn emit(ev: VEvent) {
     }
 }
 
-/// Запускает фоновый поток с хуком и приёмом Raw Input. Вызывать один раз.
+/// Запускает фоновые потоки: хук мыши и отправку накопленного движения. Вызывать один раз.
 pub fn init(emit_fn: Box<dyn Fn(VEvent) + Send + Sync>) {
     if EMIT.set(emit_fn).is_err() {
         return;
     }
-    std::thread::spawn(|| unsafe { run_message_loop() });
+    std::thread::spawn(|| unsafe { run_hook_loop() });
+    std::thread::spawn(|| loop {
+        std::thread::sleep(Duration::from_millis(16));
+        flush_move();
+    });
+}
+
+/// Центр монитора, на котором сейчас находится курсор.
+fn monitor_center(from: POINT) -> (i32, i32) {
+    unsafe {
+        let mon = MonitorFromPoint(from, MONITOR_DEFAULTTONEAREST);
+        let mut info: MONITORINFO = std::mem::zeroed();
+        info.cbSize = std::mem::size_of::<MONITORINFO>() as u32;
+        if GetMonitorInfoW(mon, &mut info) != 0 {
+            let r = info.rcMonitor;
+            return ((r.left + r.right) / 2, (r.top + r.bottom) / 2);
+        }
+    }
+    (from.x, from.y)
+}
+
+/// Плавно двигает системный курсор в центр монитора и после этого «включает» отсчёт сдвигов.
+fn glide_to_center(epoch: i32) {
+    let mut start = POINT { x: 0, y: 0 };
+    unsafe { GetCursorPos(&mut start) };
+    let (tx, ty) = monitor_center(start);
+    CX.store(tx, Ordering::SeqCst);
+    CY.store(ty, Ordering::SeqCst);
+
+    const STEPS: i32 = 28;
+    for i in 1..=STEPS {
+        if EPOCH.load(Ordering::SeqCst) != epoch || !ACTIVE.load(Ordering::SeqCst) {
+            return;
+        }
+        let t = i as f64 / STEPS as f64;
+        let e = 1.0 - (1.0 - t).powi(3); // плавное замедление в конце
+        let x = start.x as f64 + (tx - start.x) as f64 * e;
+        let y = start.y as f64 + (ty - start.y) as f64 * e;
+        unsafe { SetCursorPos(x.round() as i32, y.round() as i32) };
+        std::thread::sleep(Duration::from_millis(14));
+    }
+    unsafe { SetCursorPos(tx, ty) };
+    if EPOCH.load(Ordering::SeqCst) == epoch && ACTIVE.load(Ordering::SeqCst) {
+        DX.store(0, Ordering::SeqCst);
+        DY.store(0, Ordering::SeqCst);
+        READY.store(true, Ordering::SeqCst);
+    }
 }
 
 /// Включает или выключает режим. `own_hwnd` — окно приложения (чтобы не «возвращать» фокус самому себе).
 pub fn set_active(active: bool, own_hwnd: isize) {
     if active {
+        if ACTIVE.load(Ordering::SeqCst) {
+            return;
+        }
         let fg = unsafe { GetForegroundWindow() } as isize;
         SAVED_FG.store(if fg == own_hwnd { 0 } else { fg }, Ordering::SeqCst);
-        DX.store(0, Ordering::SeqCst);
-        DY.store(0, Ordering::SeqCst);
+        READY.store(false, Ordering::SeqCst);
+        let epoch = EPOCH.fetch_add(1, Ordering::SeqCst) + 1;
         ACTIVE.store(true, Ordering::SeqCst);
+        std::thread::spawn(move || glide_to_center(epoch));
     } else {
         ACTIVE.store(false, Ordering::SeqCst);
+        READY.store(false, Ordering::SeqCst);
+        EPOCH.fetch_add(1, Ordering::SeqCst);
+        DX.store(0, Ordering::SeqCst);
+        DY.store(0, Ordering::SeqCst);
         let fg = SAVED_FG.swap(0, Ordering::SeqCst);
         if fg != 0 {
             // Возвращаем фокус программе, из которой пришли (Zoom, презентация и т.д.).
-            unsafe {
-                SetForegroundWindow(fg as HWND);
-            }
+            unsafe { SetForegroundWindow(fg as HWND) };
         }
     }
 }
 
-unsafe extern "system" fn hook_proc(code: i32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
-    if code >= 0 && ACTIVE.load(Ordering::Relaxed) {
-        // Съедаем событие: системный курсор остаётся на месте, клики не уходят в другие окна.
-        return 1;
-    }
-    unsafe { CallNextHookEx(null_mut(), code, wparam, lparam) }
-}
-
 fn flush_move() {
+    if !ACTIVE.load(Ordering::Relaxed) {
+        return;
+    }
     let dx = DX.swap(0, Ordering::Relaxed);
     let dy = DY.swap(0, Ordering::Relaxed);
-    if (dx != 0 || dy != 0) && ACTIVE.load(Ordering::Relaxed) {
+    if dx != 0 || dy != 0 {
         emit(VEvent { kind: "move", dx, dy, button: 0, delta: 0 });
     }
 }
 
-unsafe fn handle_raw_input(lparam: LPARAM) {
-    if !ACTIVE.load(Ordering::Relaxed) {
-        return;
+unsafe extern "system" fn hook_proc(code: i32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
+    if code < 0 || !ACTIVE.load(Ordering::Relaxed) {
+        return unsafe { CallNextHookEx(null_mut(), code, wparam, lparam) };
     }
-    let handle = lparam as HRAWINPUT;
-    let header_size = size_of::<RAWINPUTHEADER>() as u32;
+    let info = unsafe { &*(lparam as *const MSLLHOOKSTRUCT) };
+    let ready = READY.load(Ordering::Relaxed);
 
-    let mut size = 0u32;
-    unsafe { GetRawInputData(handle, RID_INPUT, null_mut(), &mut size, header_size) };
-    if size == 0 {
-        return;
-    }
-    let mut buf = vec![0u8; size as usize];
-    let got = unsafe {
-        GetRawInputData(handle, RID_INPUT, buf.as_mut_ptr() as *mut _, &mut size, header_size)
-    };
-    if got == u32::MAX || (got as usize) < size_of::<RAWINPUTHEADER>() {
-        return;
-    }
-    let raw: RAWINPUT = unsafe { std::ptr::read_unaligned(buf.as_ptr() as *const RAWINPUT) };
-    if raw.header.dwType != RIM_TYPEMOUSE {
-        return;
-    }
-    let m = unsafe { raw.data.mouse };
-    // 0x01 = MOUSE_MOVE_ABSOLUTE (планшеты, удалённый рабочий стол): такие события пропускаем.
-    if m.usFlags & 0x01 == 0 {
-        DX.fetch_add(m.lLastX, Ordering::Relaxed);
-        DY.fetch_add(m.lLastY, Ordering::Relaxed);
-    }
-
-    let (flags, data) = unsafe { (m.Anonymous.Anonymous.usButtonFlags, m.Anonymous.Anonymous.usButtonData) };
-    let button_events: [(u16, &'static str, u8); 4] = [
-        (0x0001, "down", 0),
-        (0x0002, "up", 0),
-        (0x0004, "down", 2),
-        (0x0008, "up", 2),
-    ];
-    for (mask, kind, button) in button_events {
-        if flags & mask != 0 {
-            flush_move();
-            emit(VEvent { kind, dx: 0, dy: 0, button, delta: 0 });
+    match wparam as u32 {
+        WM_MOUSEMOVE => {
+            if ready {
+                let cx = CX.load(Ordering::Relaxed);
+                let cy = CY.load(Ordering::Relaxed);
+                DX.fetch_add(info.pt.x - cx, Ordering::Relaxed);
+                DY.fetch_add(info.pt.y - cy, Ordering::Relaxed);
+                // Возвращаем курсор в центр: так сдвиг всегда считается от одной точки.
+                unsafe { SetCursorPos(cx, cy) };
+            }
         }
+        WM_LBUTTONDOWN if ready => {
+            flush_move();
+            emit(VEvent { kind: "down", dx: 0, dy: 0, button: 0, delta: 0 });
+        }
+        WM_LBUTTONUP if ready => {
+            flush_move();
+            emit(VEvent { kind: "up", dx: 0, dy: 0, button: 0, delta: 0 });
+        }
+        WM_RBUTTONDOWN if ready => {
+            emit(VEvent { kind: "down", dx: 0, dy: 0, button: 2, delta: 0 });
+        }
+        WM_RBUTTONUP if ready => {
+            emit(VEvent { kind: "up", dx: 0, dy: 0, button: 2, delta: 0 });
+        }
+        WM_MOUSEWHEEL if ready => {
+            let delta = (info.mouseData >> 16) as u16 as i16 as i32;
+            emit(VEvent { kind: "wheel", dx: 0, dy: 0, button: 0, delta });
+        }
+        _ => {}
     }
-    if flags & 0x0400 != 0 {
-        // RI_MOUSE_WHEEL: знаковое значение, 120 на «щелчок»
-        emit(VEvent { kind: "wheel", dx: 0, dy: 0, button: 0, delta: data as i16 as i32 });
-    }
+    // Съедаем событие: системный курсор остаётся в центре, клики не уходят в другие окна.
+    1
 }
 
-unsafe extern "system" fn wnd_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
-    match msg {
-        WM_INPUT => {
-            unsafe { handle_raw_input(lparam) };
-            unsafe { DefWindowProcW(hwnd, msg, wparam, lparam) }
-        }
-        WM_TIMER => {
-            flush_move();
-            0
-        }
-        _ => unsafe { DefWindowProcW(hwnd, msg, wparam, lparam) },
-    }
-}
-
-unsafe fn run_message_loop() {
-    let hinst = unsafe { GetModuleHandleW(null()) };
-    let class_name = wide("SbsVirtualCursor");
-
-    let mut class: WNDCLASSW = unsafe { std::mem::zeroed() };
-    class.lpfnWndProc = Some(wnd_proc);
-    class.hInstance = hinst;
-    class.lpszClassName = class_name.as_ptr();
-    unsafe { RegisterClassW(&class) };
-
-    let title = wide("");
-    let hwnd = unsafe {
-        CreateWindowExW(
-            0,
-            class_name.as_ptr(),
-            title.as_ptr(),
-            0,
-            0,
-            0,
-            0,
-            0,
-            HWND_MESSAGE,
-            null_mut(),
-            hinst,
-            null(),
-        )
-    };
-    if hwnd.is_null() {
-        return;
-    }
-
-    let device = RAWINPUTDEVICE {
-        usUsagePage: 0x01, // Generic Desktop
-        usUsage: 0x02,     // Mouse
-        dwFlags: RIDEV_INPUTSINK,
-        hwndTarget: hwnd,
-    };
-    unsafe { RegisterRawInputDevices(&device, 1, size_of::<RAWINPUTDEVICE>() as u32) };
-
-    unsafe { SetWindowsHookExW(WH_MOUSE_LL, Some(hook_proc), hinst, 0) };
-
-    // ~60 раз в секунду отправляем накопленное движение
-    unsafe { SetTimer(hwnd, 1, 16, None) };
-
+unsafe fn run_hook_loop() {
+    unsafe { SetWindowsHookExW(WH_MOUSE_LL, Some(hook_proc), null_mut(), 0) };
     let mut msg: MSG = unsafe { std::mem::zeroed() };
     while unsafe { GetMessageW(&mut msg, null_mut(), 0, 0) } > 0 {
         unsafe {

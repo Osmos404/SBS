@@ -225,6 +225,251 @@ async function focusInput() {
   input.value?.focus();
 }
 
+async function safeRegister(key: string, fn: () => void) {
+  try {
+    await register(key, (e) => e.state === "Pressed" && fn());
+  } catch (err) {
+    // например, сочетание уже занято другой копией приложения
+    console.warn("Не удалось занять", key, err);
+  }
+}
+
+onMounted(async () => {
+  // подписка на мышь — первой, чтобы сбой с горячими клавишами её не отменял
+  unlistenV = await listen<VEvent>("vcursor", (e) => onVirtualEvent(e.payload));
+  await safeRegister(HOTKEY_TOGGLE, toggleVisible);
+  await safeRegister(HOTKEY_CLICKTHROUGH, () => setClickThrough(!clickThrough.value));
+  await safeRegister(HOTKEY_FOCUS, focusInput);
+  await safeRegister(HOTKEY_QUIT, quit);
+  await safeRegister(HOTKEY_DUAL, () => setDual(!dual.value));
+});
+
+onBeforeUnmount, onMounted, ref, watch } from "vue";
+import { getCurrentWindow } from "@tauri-apps/api/window";
+import { LogicalPosition } from "@tauri-apps/api/dpi";
+import { invoke } from "@tauri-apps/api/core";
+import { listen, type UnlistenFn } from "@tauri-apps/api/event";
+import { register, unregister } from "@tauri-apps/plugin-global-shortcut";
+import "highlight.js/styles/github-dark.css";
+import { askModel } from "./lib/ai";
+import { renderMarkdown } from "./lib/markdown";
+import { DEMO_ANSWER, DEMO_QUESTION } from "./lib/demo";
+
+const appWindow = getCurrentWindow();
+
+const HOTKEY_TOGGLE = "CommandOrControl+Alt+H";
+const HOTKEY_CLICKTHROUGH = "CommandOrControl+Alt+C";
+const HOTKEY_FOCUS = "CommandOrControl+Alt+Space";
+const HOTKEY_QUIT = "CommandOrControl+Alt+Q";
+const HOTKEY_DUAL = "CommandOrControl+Alt+X";
+
+const opacity = ref(Number(localStorage.getItem("sbs.opacity") ?? 0.88));
+const model = ref(localStorage.getItem("sbs.model") ?? "qwen2.5:7b");
+const draft = ref("");
+const heard = ref("");
+const answer = ref("");
+const error = ref("");
+const loading = ref(false);
+const clickThrough = ref(false);
+const input = ref<HTMLTextAreaElement | null>(null);
+
+const answerHtml = computed(() => (answer.value ? renderMarkdown(answer.value) : ""));
+
+watch(opacity, (v) => localStorage.setItem("sbs.opacity", String(v)));
+watch(model, (v) => localStorage.setItem("sbs.model", v));
+
+function reset(question: string) {
+  heard.value = question;
+  answer.value = "";
+  error.value = "";
+  loading.value = true;
+}
+
+async function ask() {
+  const q = draft.value.trim();
+  if (!q || loading.value) return;
+  draft.value = "";
+  reset(q);
+  try {
+    answer.value = await askModel(model.value, q);
+  } catch (e) {
+    error.value = String(e);
+  } finally {
+    loading.value = false;
+  }
+}
+
+// Тест: имитируем, что приложение услышало вопрос студента и подготовило ответ.
+function runDemo() {
+  if (loading.value) return;
+  reset(DEMO_QUESTION);
+  setTimeout(() => {
+    answer.value = DEMO_ANSWER;
+    loading.value = false;
+  }, 900);
+}
+
+// Свой красный курсор: системный курсор над окном скрыт (его видно в демонстрации),
+// а наш рисуется внутри окна, которое в демонстрацию не попадает.
+const ptr = ref({ x: -100, y: -100, show: false });
+
+function onPointerMove(e: PointerEvent) {
+  if (dual.value) return;
+  ptr.value = { x: e.clientX, y: e.clientY, show: true };
+  moveDrag(e);
+}
+
+function onPointerLeave() {
+  if (!dual.value) ptr.value.show = false;
+}
+
+// ---------- Режим «два курсора» ----------
+// Системный курсор остаётся на месте (его видят зрители), а мышь управляет
+// красным курсором, который живёт только внутри окна-подсказки.
+const dual = ref(false);
+const SENSITIVITY = 1.3;
+let unlistenV: UnlistenFn | null = null;
+let vDownTarget: HTMLElement | null = null;
+let vSlider: HTMLInputElement | null = null;
+
+interface VEvent {
+  kind: "move" | "down" | "up" | "wheel";
+  dx: number;
+  dy: number;
+  button: number;
+  delta: number;
+}
+
+function elementAtPointer(): HTMLElement | null {
+  return document.elementFromPoint(ptr.value.x, ptr.value.y) as HTMLElement | null;
+}
+
+function setSliderFromPointer(el: HTMLInputElement) {
+  const r = el.getBoundingClientRect();
+  const min = Number(el.min || 0);
+  const max = Number(el.max || 100);
+  const step = Number(el.step || 1);
+  const t = Math.min(1, Math.max(0, (ptr.value.x - r.left) / r.width));
+  const raw = min + t * (max - min);
+  el.value = String(Math.round(raw / step) * step);
+  el.dispatchEvent(new Event("input", { bubbles: true }));
+}
+
+function onVirtualEvent(p: VEvent) {
+  if (!dual.value) return;
+  if (p.kind === "move") {
+    ptr.value = {
+      x: Math.min(window.innerWidth - 1, Math.max(0, ptr.value.x + p.dx * SENSITIVITY)),
+      y: Math.min(window.innerHeight - 1, Math.max(0, ptr.value.y + p.dy * SENSITIVITY)),
+      show: true,
+    };
+    if (vSlider) setSliderFromPointer(vSlider);
+  } else if (p.kind === "down" && p.button === 0) {
+    const el = elementAtPointer();
+    vDownTarget = el;
+    if (el instanceof HTMLInputElement && el.type === "range") {
+      vSlider = el;
+      setSliderFromPointer(el);
+    } else if (el instanceof HTMLTextAreaElement || (el instanceof HTMLInputElement && el.type === "text")) {
+      el.focus();
+    }
+  } else if (p.kind === "up" && p.button === 0) {
+    vSlider = null;
+    const el = elementAtPointer();
+    const btn = el?.closest("button");
+    // «клик» засчитываем, только если отпустили над той же кнопкой, где нажали
+    if (btn && vDownTarget?.closest("button") === btn) btn.click();
+    vDownTarget = null;
+  } else if (p.kind === "wheel") {
+    const body = document.querySelector<HTMLElement>(".body");
+    if (body) body.scrollTop -= (p.delta / 120) * 60;
+  }
+}
+
+async function setDual(on: boolean) {
+  if (on === dual.value) return;
+  if (on) {
+    // сначала включаем режим (Rust запоминает окно, из которого пришли), потом забираем фокус
+    await invoke("set_virtual_cursor", { active: true });
+    dual.value = true;
+    await appWindow.show();
+    await setClickThrough(false);
+    await appWindow.setFocus();
+    ptr.value = { x: window.innerWidth / 2, y: window.innerHeight / 2, show: true };
+  } else {
+    dual.value = false;
+    vSlider = null;
+    vDownTarget = null;
+    ptr.value.show = false;
+    await invoke("set_virtual_cursor", { active: false });
+  }
+}
+
+// Перемещение окна вручную (а не штатным перетаскиванием Windows),
+// чтобы системный курсор оставался скрытым и в демонстрации его не было.
+let drag: { sx: number; sy: number; wx: number; wy: number } | null = null;
+let raf = 0;
+
+async function startDrag(e: PointerEvent) {
+  if ((e.target as HTMLElement).closest("input,label,button")) return;
+  (e.currentTarget as HTMLElement).setPointerCapture(e.pointerId);
+  const [scale, pos] = await Promise.all([appWindow.scaleFactor(), appWindow.outerPosition()]);
+  drag = { sx: e.screenX, sy: e.screenY, wx: pos.x / scale, wy: pos.y / scale };
+}
+
+function moveDrag(e: PointerEvent) {
+  if (!drag || raf) return;
+  const d = drag;
+  const x = d.wx + e.screenX - d.sx;
+  const y = d.wy + e.screenY - d.sy;
+  raf = requestAnimationFrame(() => {
+    raf = 0;
+    appWindow.setPosition(new LogicalPosition(x, y));
+  });
+}
+
+function endDrag(e: PointerEvent) {
+  drag = null;
+  (e.currentTarget as HTMLElement).releasePointerCapture?.(e.pointerId);
+}
+
+function onKey(e: KeyboardEvent) {
+  if (e.key === "Enter" && !e.shiftKey) {
+    e.preventDefault();
+    ask();
+  }
+}
+
+async function onAnswerClick(e: MouseEvent) {
+  const btn = (e.target as HTMLElement).closest<HTMLButtonElement>("button.copy");
+  if (!btn) return;
+  const code = btn.closest(".code")?.querySelector("code")?.textContent ?? "";
+  await navigator.clipboard.writeText(code);
+  btn.textContent = "Скопировано";
+  setTimeout(() => (btn.textContent = "Копировать"), 1200);
+}
+
+function quit() {
+  return appWindow.close();
+}
+
+async function toggleVisible() {
+  if (await appWindow.isVisible()) await appWindow.hide();
+  else await appWindow.show();
+}
+
+async function setClickThrough(value: boolean) {
+  clickThrough.value = value;
+  await appWindow.setIgnoreCursorEvents(value);
+}
+
+async function focusInput() {
+  await appWindow.show();
+  await setClickThrough(false);
+  await appWindow.setFocus();
+  input.value?.focus();
+}
+
 onMounted(async () => {
   await register(HOTKEY_TOGGLE, (e) => e.state === "Pressed" && toggleVisible());
   await register(
